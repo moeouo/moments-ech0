@@ -115,7 +115,31 @@ def main():
             # 处理图片
             if imgs_str and imgs_str.strip():
                 img_paths = [p.strip() for p in imgs_str.split(',') if p.strip()]
-                for sort_order, img_path in enumerate(img_paths):
+                
+                # 过滤缩略图等未被直接声明为正图的图片。
+                # 观察到你的原数据库里 `upload` 目录下很多 `_thumb` 的缩略图，且某些情况下可能会出现多余文件
+                # 如果你的原程序里，图片并不是保存在 content 里（比如只展示在瀑布流/九宫格），那么通过 content 过滤会导致所有图片丢失。
+                # 由于你说“有些没在正文用过的图片被搬走了”，可能指的是：
+                # 1. 没有清理干净的脏数据（在imgs字段里，但实际已经废弃）
+                # 2. 或者 content 中包含了 ![img](/upload/xxx.jpg) 的 Markdown 语法。
+                
+                # 判断策略：如果 content 中有包含图片路径，则以 content 中出现的为准；
+                # 如果 content 中没有任何图片路径（即全都是九宫格附图），那么就不进行强制过滤，
+                # 但过滤掉结尾带 `_thumb` 的缩略图，避免它们被当成新图片重新迁移一次。
+                valid_img_paths = []
+                content_has_imgs = "/upload/" in (content or "")
+                
+                for p in img_paths:
+                    if "_thumb" in p:
+                        continue # 坚决不要缩略图
+                        
+                    if content_has_imgs:
+                        if p in (content or ""):
+                            valid_img_paths.append(p)
+                    else:
+                        valid_img_paths.append(p)
+                
+                for sort_order, img_path in enumerate(valid_img_paths):
                     original_filename = os.path.basename(img_path)
                     if not original_filename:
                         continue
