@@ -27,12 +27,16 @@ def generate_uuid7(timestamp_ms=None):
     return f"{hex_str[0:8]}-{hex_str[8:12]}-{hex_str[12:16]}-{hex_str[16:20]}-{hex_str[20:32]}"
 
 def parse_time(time_str):
-    # 解析类似 "2023-01-01 12:00:00" 的时间
+    # 解析旧数据库里的时间，如 "2026-01-15 18:35:31+08:00" 或 "2023-01-01 12:00:00"
     try:
-        dt = datetime.strptime(time_str, "%Y-%m-%d %H:%M:%S")
+        dt = datetime.fromisoformat(time_str)
         return int(dt.timestamp())
     except ValueError:
-        return int(time.time())
+        try:
+            dt = datetime.strptime(time_str, "%Y-%m-%d %H:%M:%S")
+            return int(dt.timestamp())
+        except ValueError:
+            return int(time.time())
 
 def main():
     if not os.path.exists(SOURCE_DB_PATH):
@@ -68,7 +72,7 @@ def main():
     print(f"[+] 找到目标用户 {TARGET_USERNAME} (ID: {creator_id})")
 
     # 读取旧数据
-    source_cursor.execute("SELECT id, content, imgs, createdAt FROM Memo ORDER BY createdAt ASC")
+    source_cursor.execute("SELECT id, content, imgs, createdAt, favCount, tags FROM Memo ORDER BY createdAt ASC")
     memos = source_cursor.fetchall()
 
     success_count = 0
@@ -94,8 +98,12 @@ def main():
             return "documents"
         return "files"
 
+    # 用于缓存已经创建/获取过的标签的 ID
+    # tag_name -> tag_id
+    tags_cache = {}
+
     for row in memos:
-        memo_id, content, imgs_str, created_at_str = row
+        memo_id, content, imgs_str, created_at_str, fav_count, tags_str = row
         if not content and not imgs_str:
             continue
 
@@ -110,7 +118,7 @@ def main():
             target_cursor.execute("""
                 INSERT INTO echos (id, content, username, layout, private, user_id, fav_count, created_at)
                 VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-            """, (echo_id, content or "", TARGET_USERNAME, "waterfall", 0, creator_id, 0, ts_seconds))
+            """, (echo_id, content or "", TARGET_USERNAME, "waterfall", 0, creator_id, fav_count or 0, ts_seconds))
 
             # 处理图片
             if imgs_str and imgs_str.strip():
@@ -161,16 +169,29 @@ def main():
                     # 按照原生路由逻辑获取前缀文件夹
                     folder_prefix = resolve_path(new_key)
                     
-                    # 对应的 fileCategory
+                    # 对应的 fileCategory 和 MIME Content-Type
                     category_map = {
-                        "images": "image",
-                        "audios": "audio",
-                        "videos": "video",
-                        "documents": "document",
-                        "files": "file"
+                        "images": ("image", "image/jpeg"),
+                        "audios": ("audio", "audio/mpeg"),
+                        "videos": ("video", "video/mp4"),
+                        "documents": ("document", "application/pdf"),
+                        "files": ("file", "application/octet-stream")
                     }
-                    file_category = category_map.get(folder_prefix, "image")
+                    cat_tuple = category_map.get(folder_prefix, ("image", "image/jpeg"))
+                    file_category = cat_tuple[0]
+                    content_type = cat_tuple[1]
                     
+                    # 尝试根据扩展名获取更准确的 MIME
+                    if ext in {".png"}: content_type = "image/png"
+                    elif ext in {".gif"}: content_type = "image/gif"
+                    elif ext in {".webp"}: content_type = "image/webp"
+                    elif ext in {".svg"}: content_type = "image/svg+xml"
+                    
+                    # 获取文件大小
+                    file_size = 0
+                    if os.path.exists(src_file):
+                        file_size = os.path.getsize(src_file)
+
                     # 拷贝文件（确保前缀目录存在）
                     target_folder = os.path.join(TARGET_UPLOAD_DIR, folder_prefix)
                     os.makedirs(target_folder, exist_ok=True)
@@ -182,15 +203,47 @@ def main():
                     file_url = f"/api/files/{folder_prefix}/{new_key}"
                     
                     target_cursor.execute("""
-                        INSERT INTO files (id, "key", storage_type, provider, bucket, url, name, category, user_id, created_at)
-                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                    """, (file_id, new_key, "local", "", "", file_url, original_filename, file_category, creator_id, ts_seconds))
+                        INSERT INTO files (id, "key", storage_type, provider, bucket, url, name, content_type, size, category, user_id, created_at)
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """, (file_id, new_key, "local", "", "", file_url, original_filename, content_type, file_size, file_category, creator_id, ts_seconds))
 
                     echo_file_id = generate_uuid7(ts_ms + sort_order + 100)
                     target_cursor.execute("""
                         INSERT INTO echo_files (id, echo_id, file_id, sort_order)
                         VALUES (?, ?, ?, ?)
                     """, (echo_file_id, echo_id, file_id, sort_order))
+
+            # 处理标签
+            if tags_str and tags_str.strip():
+                # 旧库中的 tags 格式一般为逗号分隔
+                tag_names = [t.strip() for t in tags_str.split(',') if t.strip()]
+                for tag_name in tag_names:
+                    # 查找或创建 tag
+                    if tag_name not in tags_cache:
+                        target_cursor.execute("SELECT id FROM tags WHERE name = ?", (tag_name,))
+                        tag_row = target_cursor.fetchone()
+                        if tag_row:
+                            tag_id = tag_row[0]
+                        else:
+                            tag_id = generate_uuid7()
+                            target_cursor.execute("""
+                                INSERT INTO tags (id, name, usage_count, created_at)
+                                VALUES (?, ?, ?, ?)
+                            """, (tag_id, tag_name, 0, ts_seconds))
+                        tags_cache[tag_name] = tag_id
+                    
+                    tag_id = tags_cache[tag_name]
+
+                    # 插入 echo_tags 关联关系 (联合主键，忽略冲突)
+                    target_cursor.execute("""
+                        INSERT OR IGNORE INTO echo_tags (echo_id, tag_id)
+                        VALUES (?, ?)
+                    """, (echo_id, tag_id))
+                    
+                    # 更新 tag 的使用计数
+                    target_cursor.execute("""
+                        UPDATE tags SET usage_count = usage_count + 1 WHERE id = ?
+                    """, (tag_id,))
             
             target_conn.commit()
             success_count += 1
